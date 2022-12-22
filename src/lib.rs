@@ -25,7 +25,7 @@ use dyn_clone::DynClone;
 use std::marker::PhantomData;
 
 pub struct Context<T> {
-    data: T,
+    pub current: T,
 }
 
 /// 不需要实现
@@ -39,20 +39,26 @@ where
 
 dyn_clone::clone_trait_object!(<T> INextController<T>);
 
-#[derive(Clone)]
-struct NextPipeTask<T>
-where
-    T: Clone,
-{
+struct NextPipeTask<T> {
     inner: Box<dyn Interceptor<T>>,
     next: Box<dyn INextController<T>>,
     _p: PhantomData<T>,
 }
 
+impl<T> Clone for NextPipeTask<T> {
+    fn clone(&self) -> Self {
+        NextPipeTask {
+            inner: self.inner.clone(),
+            next: self.next.clone(),
+            _p: self._p.clone(),
+        }
+    }
+}
+
 #[async_trait]
 impl<T> INextController<T> for NextPipeTask<T>
 where
-    T: Send + Sync + Clone,
+    T: Send + Sync,
 {
     async fn invoke(&mut self, context: &mut Context<T>) -> Result<()> {
         self.inner.invoke(&mut self.next, context).await
@@ -73,11 +79,7 @@ where
 
 dyn_clone::clone_trait_object!(<T> Interceptor<T>);
 
-#[derive(Clone)]
-pub struct Pipeline<T>
-where
-    T: Clone,
-{
+pub struct Pipeline<T> {
     end: Box<dyn INextController<T>>,
     stack: Vec<Box<dyn Interceptor<T>>>,
     _pt: PhantomData<T>,
@@ -85,7 +87,7 @@ where
 
 impl<T> Pipeline<T>
 where
-    T: Send + Sync + Clone + 'static,
+    T: Send + Sync + 'static,
 {
     /// 默认管线 无需进行核心逻辑，只是为了支持默认
     pub fn default() -> Self {
@@ -109,10 +111,7 @@ where
     }
 }
 
-impl<T> Pipeline<T>
-where
-    T: Clone,
-{
+impl<T> Pipeline<T> {
     pub fn use_interceptor<Task>(&mut self, next: Task)
     where
         Task: Interceptor<T> + 'static,
@@ -121,10 +120,20 @@ where
     }
 }
 
+impl<T> Clone for Pipeline<T> {
+    fn clone(&self) -> Self {
+        Pipeline {
+            end: self.end.clone(),
+            stack: self.stack.clone(),
+            _pt: self._pt.clone(),
+        }
+    }
+}
+
 #[async_trait]
 impl<T> INextController<T> for Pipeline<T>
 where
-    T: Send + Sync + Clone + 'static,
+    T: Send + Sync + 'static,
 {
     async fn invoke(&mut self, context: &mut Context<T>) -> Result<()> {
         let mut moved: Box<dyn INextController<T>> = dyn_clone::clone_box(&*self.end);
@@ -146,7 +155,7 @@ mod tests {
 
     use super::{Context, INextController, Interceptor, Pipeline};
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     struct Data {
         tag: String,
     }
@@ -197,7 +206,7 @@ mod tests {
         ) -> Result<()> {
             println!("start c");
             next.invoke(context).await?;
-            context.data.tag = "c".to_owned();
+            context.current.tag = "c".to_owned();
             println!("end c");
             Ok(())
         }
@@ -206,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn test() {
         let mut context = Context {
-            data: Data { tag: "".to_owned() },
+            current: Data { tag: "".to_owned() },
         };
         let mut line = Pipeline::default();
         line.use_interceptor(TaskA {});
@@ -215,6 +224,6 @@ mod tests {
 
         _ = line.invoke(&mut context).await;
 
-        assert_eq!(context.data.tag, "c".to_owned());
+        assert_eq!(context.current.tag, "c".to_owned());
     }
 }

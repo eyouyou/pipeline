@@ -4,7 +4,6 @@ use anyhow::Result;
 
 use super::{Context, INextController};
 
-#[derive(Clone)]
 pub struct DefaultPipe<T> {
     _pt: PhantomData<T>,
 }
@@ -15,12 +14,20 @@ impl<T> DefaultPipe<T> {
     }
 }
 
+impl<T> Clone for DefaultPipe<T> {
+    fn clone(&self) -> Self {
+        Self {
+            _pt: self._pt.clone(),
+        }
+    }
+}
+
 #[async_trait]
 impl<T> INextController<T> for DefaultPipe<T>
 where
-    T: Send + Sync + Clone,
+    T: Send + Sync,
 {
-    async fn invoke(&mut self, context: &mut Context<T>) -> Result<()> {
+    async fn invoke(&mut self, _context: &mut Context<T>) -> Result<()> {
         Ok(())
     }
 }
