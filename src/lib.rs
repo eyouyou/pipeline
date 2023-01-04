@@ -22,7 +22,6 @@ extern crate async_trait;
 mod default;
 use default::DefaultPipe;
 use dyn_clone::DynClone;
-use std::marker::PhantomData;
 
 pub struct Context<T> {
     pub current: T,
@@ -30,19 +29,18 @@ pub struct Context<T> {
 
 /// 不需要实现
 #[async_trait]
-pub trait INextController<T>: DynClone
-where
-    Self: Send + Sync,
-{
+pub trait INextController<T>: DynClone {
     async fn invoke(&mut self, context: &mut Context<T>) -> Result<()>;
 }
 
+pub type UnsyncNextController<T> = dyn INextController<T> + Send;
+pub type NextController<T> = dyn INextController<T> + Send + Sync;
+
 dyn_clone::clone_trait_object!(<T> INextController<T>);
 
-struct NextPipeTask<T> {
-    inner: Box<dyn Interceptor<T>>,
-    next: Box<dyn INextController<T>>,
-    _p: PhantomData<T>,
+struct NextPipeTask<Context> {
+    inner: Box<dyn Interceptor<Context> + Send>,
+    next: Box<UnsyncNextController<Context>>,
 }
 
 impl<T> Clone for NextPipeTask<T> {
@@ -50,7 +48,6 @@ impl<T> Clone for NextPipeTask<T> {
         NextPipeTask {
             inner: self.inner.clone(),
             next: self.next.clone(),
-            _p: self._p.clone(),
         }
     }
 }
@@ -58,7 +55,7 @@ impl<T> Clone for NextPipeTask<T> {
 #[async_trait]
 impl<T> INextController<T> for NextPipeTask<T>
 where
-    T: Send + Sync,
+    T: Send,
 {
     async fn invoke(&mut self, context: &mut Context<T>) -> Result<()> {
         self.inner.invoke(&mut self.next, context).await
@@ -66,13 +63,10 @@ where
 }
 
 #[async_trait]
-pub trait Interceptor<T>: DynClone
-where
-    Self: Send + Sync,
-{
+pub trait Interceptor<T>: DynClone {
     async fn invoke(
         &mut self,
-        next: &mut Box<dyn INextController<T>>,
+        next: &mut Box<UnsyncNextController<T>>,
         context: &mut Context<T>,
     ) -> Result<()>;
 }
@@ -80,33 +74,31 @@ where
 dyn_clone::clone_trait_object!(<T> Interceptor<T>);
 
 pub struct Pipeline<T> {
-    end: Box<dyn INextController<T>>,
-    stack: Vec<Box<dyn Interceptor<T>>>,
-    _pt: PhantomData<T>,
+    end: Box<NextController<T>>,
+    stack: Vec<Box<dyn Interceptor<T> + Send + Sync>>,
 }
 
-impl<T> Pipeline<T>
+impl<Context> Default for Pipeline<Context>
 where
-    T: Send + Sync + 'static,
+    Context: Send + 'static,
 {
     /// 默认管线 无需进行核心逻辑，只是为了支持默认
-    pub fn default() -> Self {
+    fn default() -> Self {
         Pipeline {
-            end: Box::new(DefaultPipe::<T>::new()),
+            end: Box::new(DefaultPipe::new()),
             stack: vec![],
-            _pt: PhantomData,
         }
     }
-
+}
+impl<Context> Pipeline<Context> {
     /// 支持处理核心逻辑之前添加管线处理
     pub fn new<Inner>(inner: Inner) -> Self
     where
-        Inner: INextController<T> + 'static,
+        Inner: INextController<Context> + Send + Sync + 'static,
     {
         Pipeline {
             end: Box::new(inner),
             stack: vec![],
-            _pt: PhantomData,
         }
     }
 }
@@ -114,7 +106,7 @@ where
 impl<T> Pipeline<T> {
     pub fn use_interceptor<Task>(&mut self, next: Task)
     where
-        Task: Interceptor<T> + 'static,
+        Task: Interceptor<T> + Send + Sync + 'static,
     {
         self.stack.insert(0, Box::new(next));
     }
@@ -125,23 +117,21 @@ impl<T> Clone for Pipeline<T> {
         Pipeline {
             end: self.end.clone(),
             stack: self.stack.clone(),
-            _pt: self._pt.clone(),
         }
     }
 }
 
 #[async_trait]
-impl<T> INextController<T> for Pipeline<T>
+impl<C> INextController<C> for Pipeline<C>
 where
-    T: Send + Sync + 'static,
+    C: Send + 'static,
 {
-    async fn invoke(&mut self, context: &mut Context<T>) -> Result<()> {
-        let mut moved: Box<dyn INextController<T>> = dyn_clone::clone_box(&*self.end);
+    async fn invoke(&mut self, context: &mut Context<C>) -> Result<()> {
+        let mut moved: Box<UnsyncNextController<C>> = dyn_clone::clone_box(&*self.end);
         for item in self.stack.iter_mut() {
             moved = Box::new(NextPipeTask {
                 inner: item.clone(),
                 next: moved,
-                _p: PhantomData,
             });
         }
         moved.invoke(context).await?;
@@ -152,6 +142,8 @@ where
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+
+    use crate::UnsyncNextController;
 
     use super::{Context, INextController, Interceptor, Pipeline};
 
@@ -167,7 +159,7 @@ mod tests {
     impl Interceptor<Data> for TaskA {
         async fn invoke(
             &mut self,
-            next: &mut Box<dyn INextController<Data>>,
+            next: &mut Box<UnsyncNextController<Data>>,
             context: &mut Context<Data>,
         ) -> Result<()> {
             println!("start a");
@@ -184,7 +176,7 @@ mod tests {
     impl Interceptor<Data> for TaskB {
         async fn invoke(
             &mut self,
-            next: &mut Box<dyn INextController<Data>>,
+            next: &mut Box<UnsyncNextController<Data>>,
             context: &mut Context<Data>,
         ) -> Result<()> {
             println!("start b");
@@ -201,7 +193,7 @@ mod tests {
     impl Interceptor<Data> for TaskC {
         async fn invoke(
             &mut self,
-            next: &mut Box<dyn INextController<Data>>,
+            next: &mut Box<UnsyncNextController<Data>>,
             context: &mut Context<Data>,
         ) -> Result<()> {
             println!("start c");

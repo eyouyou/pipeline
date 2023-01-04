@@ -8,6 +8,9 @@ pub struct DefaultPipe<T> {
     _pt: PhantomData<T>,
 }
 
+unsafe impl<Context> Send for DefaultPipe<Context> {}
+unsafe impl<Context> Sync for DefaultPipe<Context> {}
+
 impl<T> DefaultPipe<T> {
     pub fn new() -> Self {
         DefaultPipe { _pt: PhantomData }
@@ -25,7 +28,7 @@ impl<T> Clone for DefaultPipe<T> {
 #[async_trait]
 impl<T> INextController<T> for DefaultPipe<T>
 where
-    T: Send + Sync,
+    T: Send,
 {
     async fn invoke(&mut self, _context: &mut Context<T>) -> Result<()> {
         Ok(())
