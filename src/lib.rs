@@ -20,7 +20,7 @@ pub use anyhow::{anyhow, bail};
 extern crate async_trait;
 
 mod default;
-use default::DefaultPipe;
+use default::DefaultController;
 use dyn_clone::DynClone;
 
 pub struct Context<T> {
@@ -29,17 +29,20 @@ pub struct Context<T> {
 
 /// 不需要实现
 #[async_trait]
-pub trait INextController<T>: DynClone {
+pub trait INextController<T>: DynClone
+where
+    Self: Send,
+{
     async fn invoke(&mut self, context: &mut Context<T>) -> Result<()>;
 }
 
-pub type UnsyncNextController<T> = dyn INextController<T> + Send;
-pub type NextController<T> = dyn INextController<T> + Send + Sync;
+pub type UnsyncNextController<T> = dyn INextController<T>;
+pub type NextController<T> = dyn INextController<T> + Sync;
 
 dyn_clone::clone_trait_object!(<T> INextController<T>);
 
 struct NextPipeTask<Context> {
-    inner: Box<dyn Interceptor<Context> + Send>,
+    inner: Box<dyn Interceptor<Context>>,
     next: Box<UnsyncNextController<Context>>,
 }
 
@@ -63,7 +66,10 @@ where
 }
 
 #[async_trait]
-pub trait Interceptor<T>: DynClone {
+pub trait Interceptor<T>: DynClone
+where
+    Self: Send,
+{
     async fn invoke(
         &mut self,
         next: &mut Box<UnsyncNextController<T>>,
@@ -75,26 +81,27 @@ dyn_clone::clone_trait_object!(<T> Interceptor<T>);
 
 pub struct Pipeline<T> {
     end: Box<NextController<T>>,
-    stack: Vec<Box<dyn Interceptor<T> + Send + Sync>>,
+    stack: Vec<Box<dyn Interceptor<T> + Sync>>,
 }
 
 impl<Context> Default for Pipeline<Context>
 where
-    Context: Send + 'static,
+    Context: Send + Sync + 'static,
 {
     /// 默认管线 无需进行核心逻辑，只是为了支持默认
     fn default() -> Self {
         Pipeline {
-            end: Box::new(DefaultPipe::new()),
+            end: Box::new(DefaultController::new()),
             stack: vec![],
         }
     }
 }
+
 impl<Context> Pipeline<Context> {
     /// 支持处理核心逻辑之前添加管线处理
     pub fn new<Inner>(inner: Inner) -> Self
     where
-        Inner: INextController<Context> + Send + Sync + 'static,
+        Inner: INextController<Context> + Sync + 'static,
     {
         Pipeline {
             end: Box::new(inner),
@@ -106,7 +113,7 @@ impl<Context> Pipeline<Context> {
 impl<T> Pipeline<T> {
     pub fn use_interceptor<Task>(&mut self, next: Task)
     where
-        Task: Interceptor<T> + Send + Sync + 'static,
+        Task: Interceptor<T> + Sync + 'static,
     {
         self.stack.insert(0, Box::new(next));
     }
