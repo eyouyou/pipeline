@@ -1,20 +1,19 @@
 use std::marker::PhantomData;
 
+use super::{AspectContext, INextItem};
 use anyhow::Result;
 
-use super::{Context, INextController};
-
-pub struct DefaultController<T> {
+pub struct EmptyTask<T> {
     _pt: PhantomData<T>,
 }
 
-impl<T> DefaultController<T> {
+impl<T> EmptyTask<T> {
     pub fn new() -> Self {
-        DefaultController { _pt: PhantomData }
+        EmptyTask { _pt: PhantomData }
     }
 }
 
-impl<T> Clone for DefaultController<T> {
+impl<T> Clone for EmptyTask<T> {
     fn clone(&self) -> Self {
         Self {
             _pt: self._pt.clone(),
@@ -23,11 +22,11 @@ impl<T> Clone for DefaultController<T> {
 }
 
 #[async_trait]
-impl<T> INextController<T> for DefaultController<T>
+impl<T> INextItem<T> for EmptyTask<T>
 where
-    T: Send,
+    T: Send + Sync,
 {
-    async fn invoke(&mut self, _context: &mut Context<T>) -> Result<()> {
+    async fn invoke_next(&self, _context: &mut AspectContext<T>) -> Result<()> {
         Ok(())
     }
 }

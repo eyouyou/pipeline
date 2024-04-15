@@ -12,38 +12,82 @@
 //! Z1(Z2(Z3(next)))(context)
 //!
 
-extern crate anyhow;
-use anyhow::Result;
-pub use anyhow::{anyhow, bail};
+mod as_any;
+mod default;
 
 #[macro_use]
 extern crate async_trait;
 
-mod default;
-use default::DefaultController;
+use anyhow::{anyhow, Result};
+use as_any::AsAny;
+use async_trait::async_trait;
+use default::EmptyTask;
 use dyn_clone::DynClone;
 
-pub struct Context<T> {
+/// 切面上下文
+pub struct AspectContext<T> {
     pub current: T,
+    continued: Option<()>,
+}
+
+impl<T> Clone for AspectContext<T>
+where
+    T: Clone,
+{
+    fn clone(&self) -> Self {
+        AspectContext {
+            current: self.current.clone(),
+            continued: self.continued.clone(),
+        }
+    }
+}
+
+#[async_trait]
+pub trait IContext {
+    fn check_canceled(&mut self) -> Result<()>;
+    async fn set_canceled(&mut self);
+}
+
+impl<T> AspectContext<T> {
+    pub fn new(data: T) -> Self {
+        AspectContext {
+            current: data,
+            continued: Some(()),
+        }
+    }
+}
+
+#[async_trait]
+impl<T> IContext for AspectContext<T>
+where
+    T: Send,
+{
+    fn check_canceled(&mut self) -> Result<()> {
+        self.continued.ok_or(anyhow!("canceled").into())
+    }
+
+    async fn set_canceled(&mut self) {
+        self.continued = None;
+    }
 }
 
 /// 不需要实现
 #[async_trait]
-pub trait INextController<T>: DynClone
+pub trait INextItem<T>: DynClone
 where
-    Self: Send,
+    Self: Send + Sync,
 {
-    async fn invoke(&mut self, context: &mut Context<T>) -> Result<()>;
+    async fn invoke_next(&self, context: &mut AspectContext<T>) -> Result<()>;
 }
 
-pub type UnsyncNextController<T> = dyn INextController<T>;
-pub type NextController<T> = dyn INextController<T> + Sync;
+pub type UnsyncNextItem<T> = dyn INextItem<T>;
+pub type NextItem<T> = dyn INextItem<T> + Sync;
 
-dyn_clone::clone_trait_object!(<T> INextController<T>);
+dyn_clone::clone_trait_object!(<T> INextItem<T>);
 
 struct NextPipeTask<Context> {
-    inner: Box<dyn Interceptor<Context>>,
-    next: Box<UnsyncNextController<Context>>,
+    inner: ItemBox<Context>,
+    next: Box<NextItem<Context>>,
 }
 
 impl<T> Clone for NextPipeTask<T> {
@@ -56,32 +100,29 @@ impl<T> Clone for NextPipeTask<T> {
 }
 
 #[async_trait]
-impl<T> INextController<T> for NextPipeTask<T>
+impl<T> INextItem<T> for NextPipeTask<T>
 where
-    T: Send,
+    T: Send + 'static,
 {
-    async fn invoke(&mut self, context: &mut Context<T>) -> Result<()> {
-        self.inner.invoke(&mut self.next, context).await
+    async fn invoke_next(&self, context: &mut AspectContext<T>) -> Result<()> {
+        context.check_canceled()?;
+        self.inner.invoke(&self.next, context).await
     }
 }
 
 #[async_trait]
-pub trait Interceptor<T>: DynClone
+pub trait Item<T>: DynClone + AsAny
 where
     Self: Send,
 {
-    async fn invoke(
-        &mut self,
-        next: &mut Box<UnsyncNextController<T>>,
-        context: &mut Context<T>,
-    ) -> Result<()>;
+    async fn invoke(&self, next: &Box<NextItem<T>>, context: &mut AspectContext<T>) -> Result<()>;
 }
 
-dyn_clone::clone_trait_object!(<T> Interceptor<T>);
+dyn_clone::clone_trait_object!(<T> Item<T>);
 
 pub struct Pipeline<T> {
-    end: Box<NextController<T>>,
-    stack: Vec<Box<dyn Interceptor<T> + Sync>>,
+    end: Box<NextItem<T>>,
+    stack: Vec<ItemBox<T>>,
 }
 
 impl<Context> Default for Pipeline<Context>
@@ -91,7 +132,7 @@ where
     /// 默认管线 无需进行核心逻辑，只是为了支持默认
     fn default() -> Self {
         Pipeline {
-            end: Box::new(DefaultController::new()),
+            end: Box::new(EmptyTask::new()),
             stack: vec![],
         }
     }
@@ -101,7 +142,7 @@ impl<Context> Pipeline<Context> {
     /// 支持处理核心逻辑之前添加管线处理
     pub fn new<Inner>(inner: Inner) -> Self
     where
-        Inner: INextController<Context> + Sync + 'static,
+        Inner: INextItem<Context> + Sync + 'static,
     {
         Pipeline {
             end: Box::new(inner),
@@ -111,13 +152,27 @@ impl<Context> Pipeline<Context> {
 }
 
 impl<T> Pipeline<T> {
-    pub fn use_interceptor<Task>(&mut self, next: Task)
+    pub fn use_raw_item<I>(&mut self, next: I)
     where
-        Task: Interceptor<T> + Sync + 'static,
+        I: Item<T> + 'static + Sync,
     {
         self.stack.insert(0, Box::new(next));
     }
+
+    pub fn use_item(&mut self, next: ItemBox<T>) {
+        self.stack.insert(0, next);
+    }
+
+    pub fn children_as_mut(&mut self) -> Vec<&mut ItemBox<T>> {
+        let mut vec: Vec<_> = self.stack.iter_mut().collect();
+
+        vec.reverse();
+
+        vec
+    }
 }
+
+pub type ItemBox<T> = Box<dyn Item<T> + Sync>;
 
 impl<T> Clone for Pipeline<T> {
     fn clone(&self) -> Self {
@@ -129,30 +184,27 @@ impl<T> Clone for Pipeline<T> {
 }
 
 #[async_trait]
-impl<C> INextController<C> for Pipeline<C>
+impl<C> INextItem<C> for Pipeline<C>
 where
     C: Send + 'static,
 {
-    async fn invoke(&mut self, context: &mut Context<C>) -> Result<()> {
-        let mut moved: Box<UnsyncNextController<C>> = dyn_clone::clone_box(&*self.end);
-        for item in self.stack.iter_mut() {
+    async fn invoke_next(&self, context: &mut AspectContext<C>) -> Result<()> {
+        let mut moved: Box<NextItem<C>> = dyn_clone::clone_box(&*self.end);
+        for item in self.stack.iter() {
             moved = Box::new(NextPipeTask {
                 inner: item.clone(),
                 next: moved,
             });
         }
-        moved.invoke(context).await?;
+        moved.invoke_next(context).await?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{AspectContext, INextItem, Item, NextItem, Pipeline};
     use anyhow::Result;
-
-    use crate::UnsyncNextController;
-
-    use super::{Context, INextController, Interceptor, Pipeline};
 
     #[derive(Debug)]
     struct Data {
@@ -163,14 +215,14 @@ mod tests {
     struct TaskA {}
 
     #[async_trait]
-    impl Interceptor<Data> for TaskA {
+    impl Item<Data> for TaskA {
         async fn invoke(
-            &mut self,
-            next: &mut Box<UnsyncNextController<Data>>,
-            context: &mut Context<Data>,
+            &self,
+            next: &Box<NextItem<Data>>,
+            context: &mut AspectContext<Data>,
         ) -> Result<()> {
             println!("start a");
-            next.invoke(context).await?;
+            next.invoke_next(context).await?;
             println!("end a");
             Ok(())
         }
@@ -180,14 +232,14 @@ mod tests {
     struct TaskB {}
 
     #[async_trait]
-    impl Interceptor<Data> for TaskB {
+    impl Item<Data> for TaskB {
         async fn invoke(
-            &mut self,
-            next: &mut Box<UnsyncNextController<Data>>,
-            context: &mut Context<Data>,
+            &self,
+            next: &Box<NextItem<Data>>,
+            context: &mut AspectContext<Data>,
         ) -> Result<()> {
             println!("start b");
-            next.invoke(context).await?;
+            next.invoke_next(context).await?;
             println!("end b");
             Ok(())
         }
@@ -197,14 +249,14 @@ mod tests {
     struct TaskC {}
 
     #[async_trait]
-    impl Interceptor<Data> for TaskC {
+    impl Item<Data> for TaskC {
         async fn invoke(
-            &mut self,
-            next: &mut Box<UnsyncNextController<Data>>,
-            context: &mut Context<Data>,
+            &self,
+            next: &Box<NextItem<Data>>,
+            context: &mut AspectContext<Data>,
         ) -> Result<()> {
             println!("start c");
-            next.invoke(context).await?;
+            next.invoke_next(context).await?;
             context.current.tag = "c".to_owned();
             println!("end c");
             Ok(())
@@ -213,15 +265,13 @@ mod tests {
 
     #[tokio::test]
     async fn test() {
-        let mut context = Context {
-            current: Data { tag: "".to_owned() },
-        };
+        let mut context = AspectContext::new(Data { tag: "".to_owned() });
         let mut line = Pipeline::default();
-        line.use_interceptor(TaskA {});
-        line.use_interceptor(TaskB {});
-        line.use_interceptor(TaskC {});
+        line.use_raw_item(TaskA {});
+        line.use_raw_item(TaskB {});
+        line.use_raw_item(TaskC {});
 
-        _ = line.invoke(&mut context).await;
+        _ = line.invoke_next(&mut context).await;
 
         assert_eq!(context.current.tag, "c".to_owned());
     }
