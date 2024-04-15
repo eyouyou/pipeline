@@ -14,15 +14,16 @@
 
 mod as_any;
 mod default;
+mod error;
 
 #[macro_use]
 extern crate async_trait;
-
-use anyhow::{anyhow, Result};
-use as_any::AsAny;
+use anyhow::anyhow;
+pub use as_any::{AsAny, Downcast};
 use async_trait::async_trait;
 use default::EmptyTask;
 use dyn_clone::DynClone;
+pub use error::{PipelineError, PipelineResult};
 
 /// 切面上下文
 pub struct AspectContext<T> {
@@ -44,7 +45,7 @@ where
 
 #[async_trait]
 pub trait IContext {
-    fn check_canceled(&mut self) -> Result<()>;
+    fn check_canceled(&mut self) -> PipelineResult<()>;
     async fn set_canceled(&mut self);
 }
 
@@ -62,7 +63,7 @@ impl<T> IContext for AspectContext<T>
 where
     T: Send,
 {
-    fn check_canceled(&mut self) -> Result<()> {
+    fn check_canceled(&mut self) -> PipelineResult<()> {
         self.continued.ok_or(anyhow!("canceled").into())
     }
 
@@ -77,7 +78,7 @@ pub trait INextItem<T>: DynClone
 where
     Self: Send + Sync,
 {
-    async fn invoke_next(&self, context: &mut AspectContext<T>) -> Result<()>;
+    async fn invoke_next(&self, context: &mut AspectContext<T>) -> PipelineResult<()>;
 }
 
 pub type UnsyncNextItem<T> = dyn INextItem<T>;
@@ -104,7 +105,7 @@ impl<T> INextItem<T> for NextPipeTask<T>
 where
     T: Send + 'static,
 {
-    async fn invoke_next(&self, context: &mut AspectContext<T>) -> Result<()> {
+    async fn invoke_next(&self, context: &mut AspectContext<T>) -> PipelineResult<()> {
         context.check_canceled()?;
         self.inner.invoke(&self.next, context).await
     }
@@ -115,7 +116,11 @@ pub trait Item<T>: DynClone + AsAny
 where
     Self: Send,
 {
-    async fn invoke(&self, next: &Box<NextItem<T>>, context: &mut AspectContext<T>) -> Result<()>;
+    async fn invoke(
+        &self,
+        next: &Box<NextItem<T>>,
+        context: &mut AspectContext<T>,
+    ) -> PipelineResult<()>;
 }
 
 dyn_clone::clone_trait_object!(<T> Item<T>);
@@ -188,7 +193,7 @@ impl<C> INextItem<C> for Pipeline<C>
 where
     C: Send + 'static,
 {
-    async fn invoke_next(&self, context: &mut AspectContext<C>) -> Result<()> {
+    async fn invoke_next(&self, context: &mut AspectContext<C>) -> PipelineResult<()> {
         let mut moved: Box<NextItem<C>> = dyn_clone::clone_box(&*self.end);
         for item in self.stack.iter() {
             moved = Box::new(NextPipeTask {
@@ -203,8 +208,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::PipelineResult;
+
     use super::{AspectContext, INextItem, Item, NextItem, Pipeline};
-    use anyhow::Result;
 
     #[derive(Debug)]
     struct Data {
@@ -220,7 +226,7 @@ mod tests {
             &self,
             next: &Box<NextItem<Data>>,
             context: &mut AspectContext<Data>,
-        ) -> Result<()> {
+        ) -> PipelineResult<()> {
             println!("start a");
             next.invoke_next(context).await?;
             println!("end a");
@@ -237,7 +243,7 @@ mod tests {
             &self,
             next: &Box<NextItem<Data>>,
             context: &mut AspectContext<Data>,
-        ) -> Result<()> {
+        ) -> PipelineResult<()> {
             println!("start b");
             next.invoke_next(context).await?;
             println!("end b");
@@ -254,7 +260,7 @@ mod tests {
             &self,
             next: &Box<NextItem<Data>>,
             context: &mut AspectContext<Data>,
-        ) -> Result<()> {
+        ) -> PipelineResult<()> {
             println!("start c");
             next.invoke_next(context).await?;
             context.current.tag = "c".to_owned();

@@ -1,7 +1,8 @@
 use std::marker::PhantomData;
 
+use crate::PipelineResult;
+
 use super::{AspectContext, INextItem};
-use anyhow::Result;
 
 pub struct EmptyTask<T> {
     _pt: PhantomData<T>,
@@ -26,7 +27,7 @@ impl<T> INextItem<T> for EmptyTask<T>
 where
     T: Send + Sync,
 {
-    async fn invoke_next(&self, _context: &mut AspectContext<T>) -> Result<()> {
+    async fn invoke_next(&self, _context: &mut AspectContext<T>) -> PipelineResult<()> {
         Ok(())
     }
 }
