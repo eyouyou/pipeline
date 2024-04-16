@@ -4,8 +4,10 @@
 //! 3. [`Pipeline`] aop的方式进行结合 可以使用 [`Item`] 或者 [`Item`]、[`ItemThis`]
 //!
 
+use anyhow::anyhow;
 use std::{any::Any, fmt::Debug, marker::PhantomData, sync::Arc};
 
+pub mod fallback;
 pub mod parallel;
 pub mod sequence;
 
@@ -16,7 +18,7 @@ use pipeline::{
     PipelineResult,
 };
 
-use self::sequence::SequenceTask;
+use self::{fallback::Fallback, sequence::SequenceTask};
 
 pub trait IContext {
     fn merge(&mut self, other: &Self);
@@ -71,33 +73,49 @@ where
     }
 }
 
-#[derive(Default)]
-pub struct StrategyBuilder {
+pub struct StrategyBuilder<T> {
     catch: bool,
     retry: Option<u32>,
     retry_delay: Option<Arc<dyn Fn(u32) -> u64 + Send + Sync>>,
+    /// fallback 链
+    fallback: Option<Fallback<T>>,
 }
 
-impl StrategyBuilder {
-    fn build<T>(self, task: TaskBox<T>) -> StrategicTask<T> {
+impl<T> Default for StrategyBuilder<T> {
+    fn default() -> Self {
+        StrategyBuilder {
+            catch: false,
+            retry: None,
+            retry_delay: None,
+            fallback: None,
+        }
+    }
+}
+
+impl<T> StrategyBuilder<T> {
+    fn build(self, task: TaskBox<T>) -> StrategicTask<T> {
         StrategicTask {
             inner: task,
             catch: self.catch,
             retry: self.retry.unwrap_or(0),
             retry_delay: self.retry_delay.unwrap_or(Arc::new(|_| 0)),
+            fallback: self.fallback,
         }
     }
 }
 
-impl StrategyBuilder {
+impl<T> StrategyBuilder<T> {
     /// 设置是否捕获错误 如果捕获 即使当前[`Task`]支持错误也会继续往下走.
+    ///
+    /// 如果不捕获 则需要增加fallback行为 支持fallback链
     ///
     /// 但是错误的回滚操作依赖于业务方实现 如果有错误 则会回滚 无论是否捕获.
     ///
     /// ## Returns Self 进行链式调用
     ///
-    pub fn catch(&mut self) -> &mut Self {
+    pub fn fallback<FB>(&mut self, action: Fallback<T>) -> &mut Self {
         self.catch = true;
+        self.fallback = Some(action);
         self
     }
 
@@ -178,6 +196,8 @@ pub struct StrategicTask<T> {
     catch: bool,
     retry: u32,
     retry_delay: Arc<dyn Fn(u32) -> u64 + Send + Sync>,
+    /// fallback 链
+    fallback: Option<Fallback<T>>,
 }
 
 impl<T> StrategicTask<T>
@@ -244,9 +264,19 @@ where
             index += 1;
         }
 
-        if !self.catch {
-            // 如果是catch任务 则不管结果如何 都调用next
-            result?;
+        match self.catch {
+            true => {
+                // 如果catch 调用fallback
+                self.fallback
+                    .as_ref()
+                    .ok_or(anyhow!("fallback not found"))?
+                    .invoke(context)
+                    .await?
+            }
+            false => {
+                // 如果是catch任务 则不管结果如何 都调用next
+                result?;
+            }
         }
 
         Ok(is_rollback)
@@ -282,7 +312,7 @@ where
 #[async_trait]
 impl<T> INextItem<T> for StrategicTask<T>
 where
-    T: Send + Clone + 'static,
+    T: Send + Sync + Clone + 'static,
 {
     async fn invoke_next(&self, context: &mut AspectContext<T>) -> PipelineResult<()> {
         self.invoke_this(context).await.map(|_x| ())
@@ -321,12 +351,12 @@ impl<T> Clone for StrategicTaskFlow<T> {
 
 impl<T> StrategicTaskFlow<T>
 where
-    T: Send + Clone + 'static,
+    T: Send + Sync + Clone + 'static,
 {
     pub fn new_builder<BT, Task>(inner: Task, builder: BT) -> Self
     where
         Task: TaskBoxed<T>,
-        BT: Fn(&mut StrategyBuilder),
+        BT: Fn(&mut StrategyBuilder<T>),
     {
         let mut b = StrategyBuilder::default();
 
@@ -385,16 +415,12 @@ pub trait IChildrenFlow<T, Task> {
 }
 
 pub trait IStrategicTaskFlow<T>: IChildrenFlow<T, StrategicTask<T>> {
-    fn then_builder_f<BT, Task>(
-        &mut self,
-        next: Task,
-        builder_creator: BT,
-    ) -> PipelineResult<&mut Self>
+    fn then_builder_f<BT, Task>(&mut self, next: Task, builder_creator: BT) -> PipelineResult<&mut Self>
     where
         Task: TaskBoxed<T>,
-        BT: Fn(&mut StrategyBuilder),
+        BT: Fn(&mut StrategyBuilder<T>),
     {
-        let mut b = StrategyBuilder::default();
+        let mut b = StrategyBuilder::<T>::default();
         builder_creator(&mut b);
 
         self.then_builder(next, b)?;
@@ -414,10 +440,14 @@ pub trait IStrategicTaskFlow<T>: IChildrenFlow<T, StrategicTask<T>> {
     fn then_builder<Task>(
         &mut self,
         next: Task,
-        builder: StrategyBuilder,
+        builder: StrategyBuilder<T>,
     ) -> PipelineResult<&mut Self>
     where
         Task: TaskBoxed<T>;
+
+    // fn next_use<L>(&mut self, next: L) -> &mut Self
+    // where
+    //     L: Fn(&mut AspectContext<T>) -> BoxFuture<ThisResult<()>>;
 }
 
 impl<T> IStrategicTaskFlow<T> for StrategicTaskFlow<T>
@@ -427,7 +457,7 @@ where
     fn then_builder<Task>(
         &mut self,
         next: Task,
-        builder: StrategyBuilder,
+        builder: StrategyBuilder<T>,
     ) -> PipelineResult<&mut Self>
     where
         Task: TaskBoxed<T>,

@@ -2,7 +2,10 @@
 
 use pipeline::{AspectContext, PipelineResult};
 
-use super::{IChildrenFlow, IStrategicTaskFlow, ITask, StrategicTask, StrategicTaskFlow, StrategyBuilder, TaskBoxed};
+use super::{
+    IChildrenFlow, IStrategicTaskFlow, ITask, StrategicTask, StrategicTaskFlow, StrategyBuilder,
+    TaskBoxed,
+};
 
 #[derive(Clone)]
 pub struct SequenceTask<ContextT> {
@@ -33,7 +36,11 @@ impl<ContextT> IStrategicTaskFlow<ContextT> for SequenceTask<ContextT>
 where
     ContextT: Send + Clone + 'static,
 {
-    fn then_builder<Task>(&mut self, next: Task, builder: StrategyBuilder) -> PipelineResult<&mut Self>
+    fn then_builder<Task>(
+        &mut self,
+        next: Task,
+        builder: StrategyBuilder<ContextT>,
+    ) -> PipelineResult<&mut Self>
     where
         Task: TaskBoxed<ContextT>,
     {
